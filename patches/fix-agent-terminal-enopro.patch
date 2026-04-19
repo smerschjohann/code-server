@@ -1,0 +1,238 @@
+From b6a4cd9916f4a4fbf9e0d838ec798fd4d698329b Mon Sep 17 00:00:00 2001
+From: GitHub Copilot <copilot@github.com>
+Date: Sun, 19 Apr 2026 14:00:00 +0000
+Subject: [PATCH] fix: agent terminal "Run in Terminal" throws ENOPRO in
+ code-server web browser
+
+Three-part fix for the ENOPRO error when using the agent host terminal
+integration (e.g. Copilot's "Run in Terminal") in code-server.
+
+Root cause chain:
+1. AgentHostPty.start() serialised the cwd URI via .toString() →
+   "file:///home/coder/dev/project" was sent to the agent host.
+2. agentHostTerminalManager passed that URI string verbatim to node-pty
+   as the working directory (node-pty expects a plain filesystem path).
+3. In the browser renderer getCwdResource() called
+   pathService.fileURI(cwd) which again produces file:// URIs, then
+   fileService.exists(file://...) threw ENOPRO because the browser
+   renderer has no DiskFileSystemProvider for file://.
+
+Fixes:
+1. agentHostPty.ts: send cwd.fsPath instead of cwd.toString()
+2. agentHostTerminalManager.ts: defensive URI-string → path conversion;
+   update ICreateTerminalParams.cwd type from URI to string
+3. terminalInstance.ts getCwdResource(): build vscode-remote:// URI in
+   remote contexts; add try/catch around fileService.exists()
+---
+ .../agentHost/common/state/protocol/commands.ts    |  4 +--
+ .../agentHost/node/agentHostTerminalManager.ts     | 10 ++++--
+ .../contrib/terminal/browser/agentHostPty.ts       |  4 +--
+ .../contrib/terminal/browser/terminalInstance.ts   | 31 +++++++++++++-----
+ .../terminal/test/browser/agentHostPty.test.ts     | 17 ++++++++++
+ .../terminal/test/browser/terminalInstance.test.ts | 35 ++++++++++++++------
+ 6 files changed, 79 insertions(+), 22 deletions(-)
+
+diff --git a/src/vs/platform/agentHost/common/state/protocol/commands.ts b/src/vs/platform/agentHost/common/state/protocol/commands.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/platform/agentHost/common/state/protocol/commands.ts
++++ b/src/vs/platform/agentHost/common/state/protocol/commands.ts
+@@ -234,7 +234,7 @@ export interface ICreateTerminalParams {
+ 	/** Human-readable terminal name */
+ 	name?: string;
+-	/** Initial working directory URI */
+-	cwd?: URI;
++	/** Initial working directory as a filesystem path (not a URI string) */
++	cwd?: string;
+ 	/** Initial terminal width in columns */
+ 	cols?: number;
+ 	/** Initial terminal height in rows */
+diff --git a/src/vs/platform/agentHost/node/agentHostTerminalManager.ts b/src/vs/platform/agentHost/node/agentHostTerminalManager.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/platform/agentHost/node/agentHostTerminalManager.ts
++++ b/src/vs/platform/agentHost/node/agentHostTerminalManager.ts
+@@ -6,6 +6,7 @@ import { Disposable, DisposableStore, IDisposable, toDisposable } from '../../../base/common/lifecycle.js';
+ import { Emitter } from '../../../base/common/event.js';
+ import * as platform from '../../../base/common/platform.js';
++import { URI } from '../../../base/common/uri.js';
+ import { ILogService } from '../../log/common/log.js';
+ import { createDecorator } from '../../instantiation/common/instantiation.js';
+ import { ActionType } from '../common/state/protocol/actions.js';
+@@ -145,7 +146,12 @@ export class AgentHostTerminalManager extends Disposable implements IAgentHostTe
+ 		const nodePty = await getNodePty();
+ 
+-		const cwd = params.cwd ?? process.cwd();
++		// params.cwd is typed as string but may arrive as a URI string (e.g.
++		// "file:///path") when sent over the JSON-RPC protocol from older clients.
++		// Defensively convert to a plain filesystem path so node-pty doesn't fail.
++		const rawCwd = params.cwd;
++		const cwd = rawCwd
++			? (rawCwd.includes('://') ? URI.parse(rawCwd).fsPath : rawCwd)
++			: process.cwd();
+ 		const cols = params.cols ?? 80;
+ 		const rows = params.rows ?? 24;
+diff --git a/src/vs/workbench/contrib/terminal/browser/agentHostPty.ts b/src/vs/workbench/contrib/terminal/browser/agentHostPty.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/workbench/contrib/terminal/browser/agentHostPty.ts
++++ b/src/vs/workbench/contrib/terminal/browser/agentHostPty.ts
+@@ -69,7 +69,7 @@ export class AgentHostPty extends BasePty implements ITerminalChildProcess {
+ 			if (!this._options?.attachOnly) {
+ 				await this._connection.createTerminal({
+ 					terminal: this._terminalUri.toString(),
+ 					claim: { kind: TerminalClaimKind.Client, clientId: this._connection.clientId },
+ 					name: this._options?.name,
+-					cwd: this._options?.cwd?.toString(),
++					cwd: this._options?.cwd?.fsPath,
+ 					cols: this._lastDimensions.cols > 0 ? this._lastDimensions.cols : undefined,
+ 					rows: this._lastDimensions.rows > 0 ? this._lastDimensions.rows : undefined,
+ 				});
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -2306,14 +2306,29 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 	async getCwdResource(): Promise<URI | undefined> {
+ 		const cwd = this.capabilities.get(TerminalCapability.CwdDetection)?.getCwd();
+ 		if (!cwd) {
+ 			return undefined;
+ 		}
+ 		let resource: URI;
+ 		if (this.remoteAuthority) {
+-			resource = await this._pathService.fileURI(cwd);
++			// In a remote context, create a vscode-remote:// URI so the browser's
++			// RemoteFileSystemProvider can resolve it. pathService.fileURI() always
++			// produces file:// URIs which are inaccessible from the browser renderer
++			// (no DiskFileSystemProvider registered there → ENOPRO).
++			const cwdPath = cwd.includes('://')
++				? URI.parse(cwd).path   // strip scheme+authority from any URI string
++				: cwd;
++			resource = URI.from({ scheme: Schemas.vscodeRemote, authority: this.remoteAuthority, path: cwdPath });
+ 		} else {
+ 			resource = URI.file(cwd);
+ 		}
+-		if (await this._fileService.exists(resource)) {
+-			return resource;
++		try {
++			if (await this._fileService.exists(resource)) {
++				return resource;
++			}
++		} catch {
++			// File system provider may be unavailable for this scheme (e.g. no
++			// file:// provider in the browser renderer). Return undefined so
++			// callers fall back gracefully instead of surfacing an ENOPRO error.
+ 		}
+ 		return undefined;
+ 	}
+diff --git a/src/vs/workbench/contrib/terminal/test/browser/agentHostPty.test.ts b/src/vs/workbench/contrib/terminal/test/browser/agentHostPty.test.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/workbench/contrib/terminal/test/browser/agentHostPty.test.ts
++++ b/src/vs/workbench/contrib/terminal/test/browser/agentHostPty.test.ts
+@@ -143,6 +143,23 @@ suite('AgentHostPty', () => {
+ 
++	test('start() creates terminal with filesystem path from URI cwd option', async () => {
++		const conn = new MockAgentConnection();
++		disposables.add(conn);
++		// cwd is a file:// URI — start() should send fsPath, not URI string
++		const pty = disposables.add(new AgentHostPty(1, conn, terminalUri, {
++			name: 'test',
++			cwd: URI.file('/home/coder/dev/project'),
++		}));
++
++		await pty.start();
++
++		assert.strictEqual(conn.createdTerminals.length, 1);
++		// Must be a filesystem path, not 'file:///home/coder/dev/project'
++		assert.strictEqual(conn.createdTerminals[0].cwd, '/home/coder/dev/project');
++	});
++
+ 	test('start() creates terminal and subscribes', async () => {
+diff --git a/src/vs/workbench/contrib/terminal/test/browser/terminalInstance.test.ts b/src/vs/workbench/contrib/terminal/test/browser/terminalInstance.test.ts
+index xxxxxxx..xxxxxxx 100644
+--- a/src/vs/workbench/contrib/terminal/test/browser/terminalInstance.test.ts
++++ b/src/vs/workbench/contrib/terminal/test/browser/terminalInstance.test.ts
+@@ -513,11 +513,12 @@ suite('TerminalInstance', () => {
+ 	suite('getCwdResource', () => {
+ 		let mockFileService: any;
+-		let mockPathService: any;
+ 
+ 		function createMockTerminalInstance(options: {
+ 			cwd?: string;
+ 			remoteAuthority?: string;
+ 			fileExists?: boolean;
++			fileServiceThrows?: boolean;
+ 		}): Pick<ITerminalInstance, 'getCwdResource' | 'capabilities' | 'remoteAuthority'> {
+@@ -530,20 +531,16 @@ suite('TerminalInstance', () => {
+ 			// Mock file service
+ 			mockFileService = {
+-				exists: async (resource: URI) => options.fileExists !== false
+-			};
+-
+-			// Mock path service
+-			mockPathService = {
+-				fileURI: async (path: string) => {
+-					if (options.remoteAuthority) {
+-						return URI.parse(`vscode-remote://${options.remoteAuthority}${path}`);
+-					}
+-					return URI.file(path);
++				exists: async (_resource: URI) => {
++					if (options.fileServiceThrows) {
++						throw new Error('ENOPRO: No file system provider found');
++					}
++					return options.fileExists !== false;
+ 				}
+ 			};
+ 
+@@ -554,11 +551,15 @@ suite('TerminalInstance', () => {
+ 				async getCwdResource(): Promise<URI | undefined> {
+ 					const cwd = this.capabilities.get(TerminalCapability.CwdDetection)?.getCwd();
+ 					if (!cwd) { return undefined; }
+ 					let resource: URI;
+ 					if (this.remoteAuthority) {
+-						resource = await mockPathService.fileURI(cwd);
++						const cwdPath = cwd.includes('://')
++							? URI.parse(cwd).path
++							: cwd;
++						resource = URI.from({ scheme: Schemas.vscodeRemote, authority: this.remoteAuthority, path: cwdPath });
+ 					} else {
+ 						resource = URI.file(cwd);
+ 					}
+-					if (await mockFileService.exists(resource)) {
+-						return resource;
++					try {
++						if (await mockFileService.exists(resource)) { return resource; }
++					} catch { /* provider unavailable */ }
+ 					return undefined;
+ 				}
+ 			};
+@@ -599,7 +600,8 @@ suite('TerminalInstance', () => {
+-		test('should use pathService.fileURI for remote terminal', async () => {
++		test('should use vscode-remote:// URI for remote terminal', async () => {
+ 			const testCwd = '/test/remote/path';
+ 			const instance = createMockTerminalInstance({
+ 				cwd: testCwd,
+@@ -612,6 +614,33 @@ suite('TerminalInstance', () => {
+ 			strictEqual(result?.path, testCwd);
+ 		});
+ 
++		test('should strip URI scheme when cwd is a URI string in remote context', async () => {
++			// Simulate the bug: agent host sends cwd as 'file:///home/coder/dev/project'
++			const instance = createMockTerminalInstance({
++				cwd: 'file:///home/coder/dev/project',
++				remoteAuthority: 'localhost',
++				fileExists: true
++			});
++			const result = await instance.getCwdResource();
++			strictEqual(result?.scheme, 'vscode-remote');
++			strictEqual(result?.authority, 'localhost');
++			strictEqual(result?.path, '/home/coder/dev/project');
++		});
++
++		test('should return undefined when fileService.exists throws (e.g. ENOPRO)', async () => {
++			const instance = createMockTerminalInstance({
++				cwd: '/test/path',
++				fileServiceThrows: true
++			});
++			const result = await instance.getCwdResource();
++			strictEqual(result, undefined);
++		});
+ 	});
+ });
